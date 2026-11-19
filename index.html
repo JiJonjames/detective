@@ -277,6 +277,7 @@ label.opt input{accent-color:var(--red);margin-top:5px}
      <dt><span class="kbd">F</span></dt><dd>손전등</dd>
      <dt><span class="kbd">Esc</span></dt><dd>창 닫기 · 마우스 풀기</dd>
      <dt>휴대폰</dt><dd>왼쪽 아래 드래그로 이동, 오른쪽 드래그로 시점</dd>
+     <dt>소리</dt><dd>오리지널 배경 음악 · 걸음 · 선택 효과음 (설정에서 조절)</dd>
     </dl>
    </div>
   </div>
@@ -541,6 +542,114 @@ function labResult(item,test){
 
 
 /* ====================================================================
+   AUDIO — everything is synthesized with WebAudio (no files, original music)
+   buses: music / sfx / amb -> master -> compressor ; each bus sends to a shared reverb
+   ==================================================================== */
+const AUD=(()=>{
+  let ctx=null,master,comp,buses={},rev,noiseBuf,brownBuf,started=false,musicOn=false,ambOn=false;
+  const saved=(()=>{try{return JSON.parse(localStorage.getItem("ashcombe-audio"))||{}}catch(e){return{}}})();
+  const vol={master:saved.master??.8,music:saved.music??.5,sfx:saved.sfx??.8,amb:saved.amb??.6};
+  let muted=!!saved.muted;
+  const mtof=m=>440*Math.pow(2,(m-69)/12);
+  const R=(a,b)=>a+Math.random()*(b-a);
+  function persist(){try{localStorage.setItem("ashcombe-audio",JSON.stringify({...vol,muted}))}catch(e){}}
+  function makeIR(sec,decay){const len=ctx.sampleRate*sec,b=ctx.createBuffer(2,len,ctx.sampleRate);for(let c=0;c<2;c++){const d=b.getChannelData(c);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,decay)}return b}
+  function init(){
+    if(ctx){if(ctx.state!=="running")ctx.resume();return true}
+    try{ctx=new(window.AudioContext||window.webkitAudioContext)()}catch(e){return false}
+    comp=ctx.createDynamicsCompressor();comp.threshold.value=-16;comp.ratio.value=3;comp.connect(ctx.destination);
+    master=ctx.createGain();master.connect(comp);
+    rev=ctx.createConvolver();rev.buffer=makeIR(2.6,2.4);const rg=ctx.createGain();rg.gain.value=.5;rev.connect(rg).connect(master);
+    [["music",.55],["sfx",.22],["amb",.18]].forEach(([k,send])=>{const g=ctx.createGain();g.connect(master);const s=ctx.createGain();s.gain.value=send;g.connect(s).connect(rev);buses[k]=g});
+    const n=ctx.sampleRate*2;noiseBuf=ctx.createBuffer(1,n,ctx.sampleRate);const d=noiseBuf.getChannelData(0);for(let i=0;i<n;i++)d[i]=Math.random()*2-1;
+    brownBuf=ctx.createBuffer(1,n,ctx.sampleRate);const b=brownBuf.getChannelData(0);let last=0;for(let i=0;i<n;i++){last=(last+.02*(Math.random()*2-1))/1.02;b[i]=last*3.5}
+    applyVol();return true;
+  }
+  function applyVol(){if(!ctx)return;const t=ctx.currentTime;master.gain.setTargetAtTime(muted?0:vol.master,t,.05);for(const k in buses)buses[k].gain.setTargetAtTime(vol[k],t,.05)}
+  const ok=()=>ctx&&ctx.state==="running";
+  const now=()=>ctx.currentTime;
+
+  /* ---- primitives ---- */
+  function env(g,t,peak,att,dec){g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,peak),t+att);g.gain.exponentialRampToValueAtTime(.0001,t+att+dec)}
+  function tone(f,{t=now(),type="sine",gain=.1,att=.005,dec=.2,bus="sfx",fEnd=null,lp=null}={}){
+    const o=ctx.createOscillator(),g=ctx.createGain();o.type=type;o.frequency.setValueAtTime(f,t);if(fEnd)o.frequency.exponentialRampToValueAtTime(fEnd,t+att+dec);
+    let node=o;if(lp){const fl=ctx.createBiquadFilter();fl.type="lowpass";fl.frequency.value=lp;o.connect(fl);node=fl}
+    node.connect(g).connect(buses[bus]);env(g,t,gain,att,dec);o.start(t);o.stop(t+att+dec+.05)}
+  function noise(dur,{t=now(),type="bandpass",f=1000,fEnd=null,Q=1,gain=.1,att=.003,bus="sfx"}={}){
+    const s=ctx.createBufferSource();s.buffer=noiseBuf;const fl=ctx.createBiquadFilter();fl.type=type;fl.frequency.setValueAtTime(f,t);if(fEnd)fl.frequency.exponentialRampToValueAtTime(fEnd,t+dur);fl.Q.value=Q;
+    const g=ctx.createGain();s.connect(fl).connect(g).connect(buses[bus]);env(g,t,gain,att,Math.max(.01,dur-att));s.start(t,Math.random()*1.5);s.stop(t+dur+.05)}
+  function bell(f,t,gain,dec=2.2,bus="sfx"){[[1,1],[2.76,.45],[5.4,.22],[8.9,.1]].forEach(([r,a])=>tone(f*r,{t,gain:gain*a,dec:dec/(r*.6+.4),bus}))}
+
+  /* ---- UI & game sfx ---- */
+  const S_={
+    hover(){if(!ok())return;tone(1760,{gain:.035,dec:.05});tone(2640,{gain:.012,dec:.04})},
+    click(){if(!ok())return;noise(.035,{f:2600,Q:1.2,gain:.12});tone(820,{gain:.035,dec:.05,type:"triangle"})},
+    paper(){if(!ok())return;const t=now();noise(.32,{t,f:3200,fEnd:1100,Q:.6,gain:.16,att:.04});noise(.22,{t:t+.12,f:2400,fEnd:900,Q:.7,gain:.1,att:.03})},
+    close(){if(!ok())return;noise(.16,{f:1800,fEnd:900,Q:.8,gain:.08,att:.02})},
+    page(){if(!ok())return;const t=now();noise(.25,{t,f:4200,fEnd:1500,Q:.5,gain:.14,att:.06});noise(.08,{t:t+.22,f:900,Q:1,gain:.12})},
+    unfold(){if(!ok())return;const t=now();for(let k=0;k<3;k++)noise(.2,{t:t+k*.13,f:R(1800,3000),fEnd:900,Q:.6,gain:.1,att:.04})},
+    evidence(key){if(!ok())return;const t=now();for(let k=0;k<3;k++){noise(.035,{t:t+k*.075,f:4200,Q:2,gain:.16});tone(180,{t:t+k*.075,gain:.08,dec:.05,type:"triangle"})}
+      bell(2093,t+.3,.06,1.4);if(key){bell(1046.5,t+.3,.07,2.4);tone(mtof(62),{t:t+.32,gain:.05,dec:1.8,type:"triangle",bus:"sfx"})}},
+    contra(){if(!ok())return;const t=now();[50,51,57,63].forEach(m=>tone(mtof(m),{t,type:"triangle",gain:.07,dec:2.4,lp:1800}));tone(55,{t,gain:.25,dec:1.2,fEnd:38})},
+    phone(){if(!ok())return;const t=now();for(let r=0;r<2;r++){const t0=t+r*1.3;[440,480].forEach(f=>{const o=ctx.createOscillator();o.frequency.value=f;const g=ctx.createGain();const lfo=ctx.createOscillator();lfo.type="square";lfo.frequency.value=20;const lg=ctx.createGain();lg.gain.value=.035;lfo.connect(lg).connect(g.gain);g.gain.setValueAtTime(.035,t0);g.gain.setValueAtTime(0,t0+.9);o.connect(g).connect(buses.sfx);o.start(t0);lfo.start(t0);o.stop(t0+.95);lfo.stop(t0+.95)})}},
+    chime(n){if(!ok())return;const t=now();for(let k=0;k<Math.min(n,6);k++)bell(196,t+k*1.1,.13,3.2,"amb")},
+    sting(){if(!ok())return;const t=now();tone(70,{t,gain:.35,dec:1.6,fEnd:34});noise(.4,{t,type:"lowpass",f:300,gain:.25});[38,45,50,51].forEach(m=>tone(mtof(m+12),{t:t+.05,type:"sawtooth",gain:.025,att:.3,dec:2.6,lp:900}))},
+    result(good){if(!ok())return;const t=now();(good?[62,66,69,74,78]:[62,60,57,53,50]).forEach((m,i)=>{tone(mtof(m),{t:t+i*.22,type:"triangle",gain:.09,dec:2.2,lp:3000,bus:"music"});if(good)bell(mtof(m+12),t+i*.22,.02,1.6)})},
+    toggle(){if(!ok())return;const t=now();noise(.02,{t,f:3500,Q:3,gain:.15});noise(.02,{t:t+.06,f:2500,Q:3,gain:.1})},
+    creak(){if(!ok()||Math.random()<.45)return;const t=now(),o=ctx.createOscillator();o.type="sawtooth";const curve=new Float32Array(16).map(()=>R(120,240));o.frequency.setValueCurveAtTime(curve,t,.7);const fl=ctx.createBiquadFilter();fl.type="bandpass";fl.frequency.value=900;fl.Q.value=5;const g=ctx.createGain();o.connect(fl).connect(g).connect(buses.sfx);env(g,t,.05,.15,.55);o.start(t);o.stop(t+.8)},
+    step(surface,run){if(!ok())return;const t=now(),v=(run?1.25:1)*R(.85,1.15),p=R(.9,1.1);
+      if(surface==="marble"){noise(.06,{t,f:3200*p,Q:1.3,gain:.2*v});tone(150*p,{t,gain:.12*v,dec:.07,fEnd:90})}
+      else if(surface==="carpet"){noise(.13,{t,type:"lowpass",f:520*p,gain:.16*v,att:.01});tone(85,{t,gain:.09*v,dec:.09})}
+      else if(surface==="stone"){noise(.08,{t,f:1800*p,Q:.6,gain:.2*v});noise(.03,{t:t+.01,f:5200,Q:1,gain:.05*v})}
+      else{noise(.09,{t,f:950*p,Q:.8,gain:.18*v});tone(95*p,{t,gain:.2*v,dec:.1,fEnd:70});if(Math.random()<.07)setTimeout(()=>S_.creak(),60)}}
+  };
+
+  /* ---- ambience: rain, fireplace, clock ---- */
+  let fireGain=null,tickAcc=0,tickFlip=false,crackAcc=0,firePos=[11.3,-7.5],clockPos=[1.6,-3.4];
+  function startAmbient(){if(!ctx||ambOn)return;ambOn=true;
+    const rain=ctx.createBufferSource();rain.buffer=brownBuf;rain.loop=true;const lp=ctx.createBiquadFilter();lp.type="lowpass";lp.frequency.value=1200;const rg=ctx.createGain();rg.gain.value=.22;rain.connect(lp).connect(rg).connect(buses.amb);rain.start();
+    const drip=ctx.createBufferSource();drip.buffer=noiseBuf;drip.loop=true;const hp=ctx.createBiquadFilter();hp.type="highpass";hp.frequency.value=5000;const dg=ctx.createGain();dg.gain.value=.012;drip.connect(hp).connect(dg).connect(buses.amb);drip.start();
+    const fire=ctx.createBufferSource();fire.buffer=brownBuf;fire.loop=true;const fl=ctx.createBiquadFilter();fl.type="lowpass";fl.frequency.value=420;fireGain=ctx.createGain();fireGain.gain.value=0;fire.connect(fl).connect(fireGain).connect(buses.amb);fire.start();
+  }
+  function prox(p,x,z,r){const d=Math.hypot(p[0]-x,p[1]-z);return Math.max(0,1-d/r)}
+  function update(dt,x,z,room){
+    if(!ok()||!ambOn)return;
+    const fp=room==="drawing"?prox(firePos,x,z,10):0;fireGain.gain.setTargetAtTime(fp*.5,now(),.3);
+    crackAcc+=dt;if(fp>0&&crackAcc>R(.08,.5)){crackAcc=0;noise(R(.008,.03),{f:R(1800,5000),Q:R(.5,3),gain:fp*R(.05,.25),bus:"amb"})}
+    tickAcc+=dt;if(tickAcc>=1){tickAcc-=1;tickFlip=!tickFlip;const cp=room==="hall"?prox(clockPos,x,z,9):room==="study"||room==="office"||room==="billiard"||room==="drawing"?prox(clockPos,x,z,7)*.25:0;if(cp>0){noise(.015,{f:tickFlip?2600:2100,Q:4,gain:cp*.22,bus:"amb"});tone(tickFlip?1300:1050,{gain:cp*.04,dec:.03,bus:"amb"})}}
+  }
+
+  /* ---- music: original slow D-minor nocturne, procedurally sequenced ---- */
+  const BPM=64,beat=60/BPM,bar=beat*4;
+  const PROG_A=[[50,53,57],[46,50,53],[43,46,50],[45,49,52,55]];
+  const PROG_B=[[41,45,48],[40,43,48],[50,53,57],[45,49,52]];
+  const SCALE=[62,64,65,67,69,70,72,74,76,77];
+  let nextBar=0,barIdx=0,melIdx=4,schedTimer=null;let mood={tension:0,eerie:0};
+  function piano(m,t,v){const f=mtof(m),o1=ctx.createOscillator(),o2=ctx.createOscillator(),fl=ctx.createBiquadFilter(),g=ctx.createGain();o1.type="triangle";o2.type="sine";o1.frequency.value=f;o2.frequency.value=f*2.001;fl.type="lowpass";fl.frequency.setValueAtTime(3200,t);fl.frequency.exponentialRampToValueAtTime(900,t+1.5);const g2=ctx.createGain();g2.gain.value=.3;o1.connect(fl);o2.connect(g2).connect(fl);fl.connect(g).connect(buses.music);env(g,t,v,.006,2.4);o1.start(t);o2.start(t);o1.stop(t+2.5);o2.stop(t+2.5)}
+  function pad(chord,t,dur){chord.forEach(m=>[-7,7].forEach(dt_=>{const o=ctx.createOscillator(),fl=ctx.createBiquadFilter(),g=ctx.createGain();o.type="sawtooth";o.frequency.value=mtof(m);o.detune.value=dt_;fl.type="lowpass";fl.frequency.value=700+mood.tension*500;fl.Q.value=.4;o.connect(fl).connect(g).connect(buses.music);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.011,t+1.2);g.gain.setValueAtTime(.011,t+dur-.6);g.gain.exponentialRampToValueAtTime(.0001,t+dur+.9);o.start(t);o.stop(t+dur+1)}))}
+  function musicBox(m,t,v){tone(mtof(m),{t,gain:v,dec:1.8,bus:"music"});tone(mtof(m)*3,{t,gain:v*.15,dec:.6,bus:"music"})}
+  function playBar(t,i){
+    const sec=Math.floor(i/4)%4,prog=sec===2?PROG_B:PROG_A,chord=prog[i%4];
+    pad(chord,t,bar);
+    const root=chord[0]-12;tone(mtof(root),{t,gain:.16,att:.02,dec:beat*1.9,bus:"music",lp:400});tone(mtof(root),{t:t+beat*2,gain:.11,att:.02,dec:beat*1.6,bus:"music",lp:400});
+    const tones=chord.map(m=>m+12).concat(chord.map(m=>m+24));const pat=[0,1,2,1,3,2,1,2];
+    pat.forEach((p,k)=>{if(Math.random()<.78+mood.tension*.2)piano(tones[p%tones.length],t+k*beat/2+R(0,.012),R(.035,.06))});
+    if(i%2===1||mood.eerie){for(let k=0;k<4;k++){if(Math.random()<.35)continue;melIdx=Math.max(0,Math.min(SCALE.length-1,melIdx+[-2,-1,-1,1,1,2][Math.floor(Math.random()*6)]));let m=SCALE[melIdx];if(k===0&&!chord.some(c=>(c-m)%12===0))m=chord[0]+24;musicBox(m+12,t+[0,1.5,2,3][k]*beat,.035)}}
+    if(mood.eerie){[0,1].forEach(s=>{const o=ctx.createOscillator(),fl=ctx.createBiquadFilter(),g=ctx.createGain(),vib=ctx.createOscillator(),vg=ctx.createGain();o.type="sawtooth";o.frequency.value=mtof(81+s);vib.frequency.value=5.2;vg.gain.value=4;vib.connect(vg).connect(o.frequency);fl.type="lowpass";fl.frequency.value=2400;o.connect(fl).connect(g).connect(buses.music);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.006*mood.eerie,t+1.5);g.gain.exponentialRampToValueAtTime(.0001,t+bar+.5);o.start(t);vib.start(t);o.stop(t+bar+.6);vib.stop(t+bar+.6)})}
+    if(mood.tension>0)for(let k=0;k<4;k++){tone(52,{t:t+k*beat,gain:.22*mood.tension,dec:.18,fEnd:38,bus:"music"});tone(48,{t:t+k*beat+.22,gain:.14*mood.tension,dec:.16,fEnd:36,bus:"music"})}
+  }
+  function schedule(){if(!musicOn||!ok())return;if(nextBar<now())nextBar=now()+.1;while(nextBar<now()+.6){playBar(nextBar,barIdx);nextBar+=bar;barIdx++}}
+  function startMusic(){if(!ctx)return;musicOn=true;nextBar=now()+.3;if(!schedTimer)schedTimer=setInterval(schedule,120)}
+  function stopMusic(){musicOn=false}
+  function setMood(m){Object.assign(mood,m)}
+
+  Object.assign(S_,{init,startAmbient,startMusic,stopMusic,update,setMood,vol,applyVol,persist,ready:()=>!!ctx});
+  Object.defineProperty(S_,"muted",{get(){return muted},set(v){muted=v;applyVol();persist()}});
+  Object.defineProperty(S_,"musicOn",{get(){return musicOn}});
+  return S_;
+})();
+
+/* ====================================================================
    GAME EXTENSIONS
    ==================================================================== */
 const ROOMS={hall:"현관 홀",study:"서재",office:"비서 사무실",library:"서가",drawing:"응접실",billiard:"당구실",guest:"펠 박사의 객실",pantry:"식료품실",darkroom:"토머스의 암실"};
@@ -589,12 +698,13 @@ function tempText(){
 /* ====================================================================
    GAME LOGIC
    ==================================================================== */
-function give(ids){const fr=[];(ids||[]).forEach(id=>{if(!S.f.has(id)){S.f.add(id);fr.push(id)}});return fr}
+function give(ids){const fr=[];(ids||[]).forEach(id=>{if(!S.f.has(id)){S.f.add(id);fr.push(id)}});if(fr.length){const k=fr.some(id=>EV[id].key);setTimeout(()=>AUD.evidence(k),60)}return fr}
 function evTags(fr){return fr.map(id=>`<span class="newev ${D().stars&&EV[id].key?"key":""}">+ ${D().stars&&EV[id].key?"★ ":""}${esc(EV[id].n)}</span>`).join("")}
 function advance(min){
-  S.time+=min;
+  const h0=Math.floor((9*60+S.time)/60);S.time+=min;
   S.lab.filter(j=>!j.done&&j.ready<=S.time).forEach(j=>{j.done=true;const id=labResult(j.item,j.test);const fr=give([id]);
-    S.log.unshift({t:fmt(j.ready),m:`분석관 전화: ${LABITEMS[j.item]} — ${EV[id].d}`});if(fr.length)toast(`☎ 분석관 전화 — ${EV[id].n}`,true)});
+    S.log.unshift({t:fmt(j.ready),m:`분석관 전화: ${LABITEMS[j.item]} — ${EV[id].d}`});if(fr.length){toast(`☎ 분석관 전화 — ${EV[id].n}`,true);AUD.phone()}});
+  const h1=Math.floor((9*60+Math.min(S.time,D().limit||1e9))/60);if(h1>h0&&min>0)setTimeout(()=>AUD.chime(h1%12||12),400);
   if(D().limit&&S.time>=D().limit){S.time=D().limit;S.over=true}
 }
 function setReport(hot,h,b){S.report={hot,h,b}}
@@ -634,7 +744,7 @@ function contradictions(){
   return o;
 }
 function after(){
-  if(D().flag)contradictions().forEach(c=>{if(!S.seenContra.has(c.id)){S.seenContra.add(c.id);toast("모순 발견 — "+c.n)}});
+  if(D().flag)contradictions().forEach(c=>{if(!S.seenContra.has(c.id)){S.seenContra.add(c.id);toast("모순 발견 — "+c.n);AUD.contra()}});
   save();updateHUD();if(panelOpen)renderPanel();updateMarkers();
   if(S.over){closePanel();openAccuse(true)}
 }
@@ -670,8 +780,8 @@ function updateHUD(){
 
 /* ---------- interaction panel (sidebar) ---------- */
 let panelOpen=null;
-function openPanel(id){panelOpen=id;releaseMouse();renderPanel();$("panel").classList.remove("hidden");if(id.startsWith("p:")){const w=id.slice(2);if(!S.met.has(w)){S.met.add(w);save()}}const f=$("pBody").querySelector("button");if(f)f.focus({preventScroll:true})}
-function closePanel(){panelOpen=null;$("panel").classList.add("hidden")}
+function openPanel(id){if(!panelOpen)AUD.paper();panelOpen=id;releaseMouse();renderPanel();$("panel").classList.remove("hidden");if(id.startsWith("p:")){const w=id.slice(2);if(!S.met.has(w)){S.met.add(w);save()}}const f=$("pBody").querySelector("button");if(f)f.focus({preventScroll:true})}
+function closePanel(){if(panelOpen)AUD.close();panelOpen=null;$("panel").classList.add("hidden")}
 function crumbHTML(room,leaf){return `<span class="hide-s">애시콤 홀</span><span class="sep hide-s">›</span><span>${ROOMS[room]}</span><span class="sep">›</span><b>${esc(leaf)}</b>`}
 function reportHTML(id){return S.report&&S.report.hot===id?`<div class="report" role="status"><div class="rh">${esc(S.report.h)}</div>${S.report.b}</div>`:""}
 function renderPanel(){
@@ -725,7 +835,7 @@ $("modal").addEventListener("click",e=>{if(e.target.closest("[data-close]")||e.t
 
 /* notebook */
 function openNotebook(tab){
-  if(tab)S.tab=tab;modalKind="note";
+  if(modalKind!=="note")AUD.page();if(tab)S.tab=tab;modalKind="note";
   const tabs=[["ev","물증"],["tm","증언"]];if(D().flag)tabs.push(["contra","모순"]);tabs.push(["calc","계산"],["log","기록"]);
   const cnt={ev:[...S.f].filter(i=>EV[i].k==="물증").length,tm:[...S.f].filter(i=>EV[i].k!=="물증").length,contra:contradictions().length};
   let h=sheetHead("수사 수첩",`${fmt(S.time)} · ${D().name}`);
@@ -752,13 +862,17 @@ $("sheet").addEventListener("click",e=>{const b=e.target.closest("[data-tab]");i
 function openSettings(){
   modalKind="set";const h=sheetHead("설정",`품질 ${({low:"낮음",med:"보통",high:"높음"})[QK]} · 시작 화면에서 변경`)+`<div></div><div class="sheet-b">
   <div class="switch"><span>손전등 <span class="kbd">F</span></span><button class="btn btn-ghost" id="sTorch">${S.torch?"끄기":"켜기"}</button></div>
-  <div class="switch"><span>빗소리 (배경음)</span><button class="btn btn-ghost" id="sRain">${rainOn?"끄기":"켜기"}</button></div>
+  <div class="switch"><span>소리</span><button class="btn btn-ghost" id="sMute">${AUD.muted?"소리 켜기":"음소거"}</button></div>
+  <div class="switch"><span>배경 음악</span><button class="btn btn-ghost" id="sMusic">${AUD.musicOn?"끄기":"켜기"}</button></div>
+  ${[["master","전체 음량"],["music","음악"],["sfx","효과음 (걸음 · 선택 · 단서)"],["amb","환경음 (비 · 벽난로 · 시계)"]].map(([k,n])=>`<div class="switch"><label for="v_${k}">${n}</label><input type="range" id="v_${k}" data-vol="${k}" min="0" max="1" step="0.05" value="${AUD.vol[k]}" style="accent-color:var(--orange);width:min(220px,45%)"></div>`).join("")}
   <div class="switch"><span>성능 정보 (FPS · 폴리곤 · 드로우 콜)</span><button class="btn btn-ghost" id="sPerf">${perfOn?"숨기기":"보이기"}</button></div>
   <div class="switch"><span>마우스 감도</span><input type="range" id="sSens" min="0.4" max="2" step="0.1" value="${sens}" style="accent-color:var(--orange)"></div>
   <div class="switch"><span>수사를 처음부터 다시</span><button class="btn btn-ghost" id="sRestart">시작 화면으로</button></div></div>`;
   openModal("set",h);
   $("sTorch").onclick=()=>{toggleTorch();openSettings()};
-  $("sRain").onclick=()=>{toggleRain();openSettings()};
+  $("sMute").onclick=()=>{AUD.init();AUD.muted=!AUD.muted;openSettings()};
+  $("sMusic").onclick=()=>{AUD.init();AUD.musicOn?AUD.stopMusic():AUD.startMusic();openSettings()};
+  $("sheet").querySelectorAll("[data-vol]").forEach(r=>{r.oninput=()=>{AUD.vol[r.dataset.vol]=parseFloat(r.value);AUD.applyVol()};r.onchange=()=>{AUD.persist();AUD.click()}});
   $("sPerf").onclick=()=>{perfOn=!perfOn;$("perf").classList.toggle("hidden",!perfOn);openSettings()};
   $("sSens").oninput=e=>{sens=parseFloat(e.target.value)};
   $("sRestart").onclick=()=>{save();location.reload()};
@@ -766,7 +880,7 @@ function openSettings(){
 
 /* map */
 function openMap(){
-  modalKind="map";let h=sheetHead("애시콤 홀 평면도",`1층 · 현재 ${ROOMS[curRoom]} · ${fmt(S.time)}`)+`<div></div><div class="sheet-b">
+  AUD.unfold();modalKind="map";let h=sheetHead("애시콤 홀 평면도",`1층 · 현재 ${ROOMS[curRoom]} · ${fmt(S.time)}`)+`<div></div><div class="sheet-b">
    <canvas id="mapCanvas" width="1000" height="${Math.round(1000*32/24*0.62)}"></canvas>
    <div class="legend"><span><i style="background:var(--orange)"></i>나</span><span><i style="background:#ffb36b;border-radius:50%"></i>만난 사람</span><span><i style="background:#3a1517"></i>가 본 방</span>${S.diff==="easy"?`<span><i style="background:var(--red);border-radius:50%"></i>조사할 곳</span>`:""}</div>
    <p class="sect-title" style="margin:6px 0 0">빠른 이동 · ${costTag("move")}</p>
@@ -782,7 +896,7 @@ function openMap(){
 }
 function fastTravel(room){
   if(room===curRoom||(!S.visited.has(room)&&S.diff!=="easy")||S.over)return;
-  advance(D().cost.move);const e=ENTRY[room];player.x=e[0];player.z=e[1];player.yaw=e[2];player.pitch=0;
+  advance(D().cost.move);const e=ENTRY[room];for(let k=0;k<4;k++)setTimeout(()=>AUD.step(surfaceAt(e[0],e[1]),false),120+k*260);player.x=e[0];player.z=e[1];player.yaw=e[2];player.pitch=0;
   S.log.unshift({t:fmt(S.time),m:`${ROOMS[room]}(으)로 이동`});
   modalKind=null;$("modal").classList.add("hidden");after();
 }
@@ -792,7 +906,7 @@ const METHODS=[["cn_glass","브랜디 잔에 시안화칼륨을 넣었다"],["cn
 const MOTIVES=[["inherit","저택과 재산 상속"],["debt","도박 빚"],["cover","과거의 살인(캐서린)이 드러나는 것을 막으려고"],["grudge","해고에 대한 원한"],["affair","치정"]];
 const TIMES=[["t1","22:00–23:00"],["t2","23:00–00:30"],["t3","00:30–01:30"],["t4","01:30–03:00"]];
 function openAccuse(forced){
-  const d=S.diff;modalKind=forced?"forced":"acc";
+  const d=S.diff;AUD.sting();modalKind=forced?"forced":"acc";
   let h=sheetHead("범인을 지목한다",forced?"18:00 — 검시관이 보고서를 기다린다":"경찰서장에게 보고 · 제출하면 수사가 끝난다")+`<div></div><div class="sheet-b">`;
   h+=`<fieldset><legend>범인</legend>${SUSPECTS.map(k=>`<label class="opt"><input type="radio" name="cul" value="${k}"> ${PEOPLE[k].n} <span class="note-s">${PEOPLE[k].r}</span></label>`).join("")}</fieldset>`;
   if(d!=="easy"){h+=`<fieldset><legend>수법</legend>${METHODS.map(([v,n])=>`<label class="opt"><input type="radio" name="met" value="${v}"> ${n}</label>`).join("")}</fieldset><fieldset><legend>동기</legend>${MOTIVES.map(([v,n])=>`<label class="opt"><input type="radio" name="mot" value="${v}"> ${n}</label>`).join("")}</fieldset>`}
@@ -838,7 +952,7 @@ function finish(a){
     <li><b>11월의 말벌.</b> 영국에서는 겨울이 오면 일벌을 포함한 대부분의 말벌이 죽고 새 여왕벌만 동면한다. <a href="https://cardiff.gov.uk/wasps" target="_blank" rel="noopener">Cardiff Council</a></li>
    </ol><p class="note-s">인물, 저택, 마을, 약국 이름과 사건은 모두 허구다.</p>
    <div class="sheet-f"><button class="btn btn-ghost" id="toStart">시작 화면으로</button><button class="btn btn-cta" id="again">같은 계급으로 다시</button></div></div>`;
-  clearSave();openModal("result",h);
+  clearSave();openModal("result",h);AUD.result(okC&&score>=75);
   $("toStart").onclick=()=>location.reload();
   $("again").onclick=()=>{try{localStorage.setItem("ashcombe-again",S.diff)}catch(e){}location.reload()};
 }
@@ -850,7 +964,7 @@ const QS={low:{pr:1,seg:10,books:.35,std:false,aa:false,folds:6},med:{pr:1.5,seg
 let QK="med",Q=QS.med;
 let renderer,scene,cam,hemi,torch,winMat,flameMesh;
 const MATS={},BATCH={},INST={},HOT={},HOTGROUPS=[],OBST=[],LAMPS=[],BLOBS=[],P3D={},MARKERS={};
-let rayBlockers=[],clockHands=null,sens=1,perfOn=false,rainOn=false;
+let rayBlockers=[],clockHands=null,sens=1,perfOn=false;const RUGS=[];
 const player={x:0,z:-9.5,yaw:Math.PI,pitch:0,vx:0,vz:0,bob:0};
 let curRoom="hall";
 const H=3.4,TW=0.16;
@@ -969,7 +1083,7 @@ function shelf(f,room,w,h,dep=.38,books=true){const lv=Math.max(3,Math.round(h/.
     let x=-w/2+.06;while(x<w/2-.08){if(rnd()>Q.books){x+=.04+rnd()*.12;continue}
       const bw=.025+rnd()*.035,bh=Math.min(step-.05,.17+rnd()*.13),bd=dep*(.65+rnd()*.25);const pal=[0x5a0d12,0x8a1a1c,0x1a1414,0x2a1a12,0xb4561a,0x3a2a1e,0xcfbf9f,0x2a3324,0x6a3014];
       const tilt=rnd()<.06?(rnd()-.5)*.5:0;inst("book",f(x+bw/2,y+.015+bh/2,dep/2+.02,0,0,tilt,bw,bh,bd),pal[Math.floor(rnd()*pal.length)]);x+=bw+.002}}}
-function rugAt(x,z,w,d,room,ry=0){put(new THREE.PlaneGeometry(w,d),"rug",room,M4(x,.006,z,-Math.PI/2,0,ry))}
+function rugAt(x,z,w,d,room,ry=0){const sw=Math.abs(Math.sin(ry))>.5;RUGS.push([x,z,sw?d:w,sw?w:d]);put(new THREE.PlaneGeometry(w,d),"rug",room,M4(x,.006,z,-Math.PI/2,0,ry))}
 function tableLamp(x,y,z,room,col=0xff9a4a,int=1){const f=F(x,z,0,y);put(lathe([[0,0],[.09,0],[.09,.02],[.03,.05],[.02,.3],[.035,.32],[0,.33]]),"brass",room,f(0,0,0));put(lathe([[.08,.32],[.17,.52],[.16,.53],[.07,.34]],Q.seg),"shade",room,f(0,0,0));lamp(x,y+.42,z,col,int,room)}
 function floorLamp(x,z,room){const f=F(x,z);put(lathe([[0,0],[.18,0],[.18,.03],[.04,.06],[.025,1.5],[0,1.5]]),"brass",room,f(0,0,0));put(lathe([[.12,1.45],[.26,1.72],[.25,1.73],[.11,1.46]],Q.seg),"shade",room,f(0,0,0));lamp(x,1.6,z,0xffa060,1,room);blob(x,z,.5,.5)}
 function chandelier(x,z,room,int=1.1){const f=F(x,z,0,H);put(cyl(.012,.012,.6,6),"brass",room,f(0,-.3,0));put(lathe([[0,-.6],[.12,-.62],[.16,-.72],[.08,-.8],[0,-.82]]),"brass",room,f(0,0,0));const arms=6;for(let a=0;a<arms;a++){const t=a/arms*Math.PI*2;put(new THREE.TorusGeometry(.18,.008,6,Q.seg,Math.PI/2),"brass",room,f(Math.cos(t)*.16,-.78,Math.sin(t)*.16,0,-t,Math.PI));put(lathe([[.03,0],[.06,.08],[.0,.08]],10),"shade",room,f(Math.cos(t)*.34,-.62,Math.sin(t)*.34));for(let k=0;k<3;k++)inst("drop",f(Math.cos(t+k*.3)*.24,-.9-k*.05,Math.sin(t+k*.3)*.24,0,0,0,.02,.04,.02),0xffd9a8)}lamp(x,H-.8,z,0xffb070,int,room)}
@@ -1283,7 +1397,7 @@ function bindControls(){
   $("useBtn").addEventListener("click",()=>{if(hovered)interact()});
 }
 function look(dx,dy){player.yaw-=dx*.0022*sens;player.pitch=Math.max(-1.25,Math.min(1.25,player.pitch-dy*.0022*sens))}
-function toggleTorch(){S.torch=!S.torch;toast(S.torch?"손전등을 켰다":"손전등을 껐다",true);save()}
+function toggleTorch(){AUD.toggle();S.torch=!S.torch;toast(S.torch?"손전등을 켰다":"손전등을 껐다",true);save()}
 function interact(){if(!hovered||S.over)return;openPanel(hovered)}
 function collide(nx,nz,ox,oz){const R=.3;for(const[dx,dz]of[[-R,-R],[R,-R],[-R,R],[R,R]]){const a=cellOf(ox+dx,oz+dz),b=cellOf(nx+dx,nz+dz);if(a[0]!==b[0]||a[1]!==b[1]){if(a[0]!==b[0]&&a[1]!==b[1]){if(!passable(a,[b[0],a[1]])||!passable([b[0],a[1]],b))return true}else if(!passable(a,b))return true}}
   for(const o of OBST){const cx=Math.max(o[0],Math.min(nx,o[1])),cz=Math.max(o[2],Math.min(nz,o[3]));if((nx-cx)**2+(nz-cz)**2<R*R)return true}
@@ -1300,7 +1414,7 @@ function move(dt){
   const nx=player.x+player.vx*dt,nz=player.z+player.vz*dt;
   if(!collide(nx,player.z,player.x,player.z))player.x=nx;else player.vx=0;
   if(!collide(player.x,nz,player.x,player.z))player.z=nz;else player.vz=0;
-  const spd=Math.hypot(player.vx,player.vz);if(spd>.2)player.bob+=dt*spd*3.2;
+  const spd=Math.hypot(player.vx,player.vz);if(spd>.2){const b0=Math.floor(player.bob/Math.PI);player.bob+=dt*spd*3.2;if(Math.floor(player.bob/Math.PI)!==b0)AUD.step(surfaceAt(player.x,player.z),spd>3.2)}
 }
 const ray=new THREE.Raycaster(),c0=new THREE.Vector2(0,0);
 function updateHover(){
@@ -1316,7 +1430,7 @@ function hotDone(id){if(id.startsWith("p:")){const w=id.slice(2);return TOPICS[w
 function setHover(id){
   if(id===hovered)return;
   if(hovered&&HOT[hovered])HOT[hovered].group.traverse(o=>{if(o.isMesh&&o.material.emissive&&o.userData.e0){o.material.emissive.copy(o.userData.e0);o.material.emissiveIntensity=o.userData.ei0}});
-  hovered=id;$("crosshair").classList.toggle("on",!!id);$("useBtn").style.display=id&&isTouch?"block":"none";
+  if(id)AUD.hover();hovered=id;$("crosshair").classList.toggle("on",!!id);$("useBtn").style.display=id&&isTouch?"block":"none";
   if(!id){$("prompt").classList.add("hidden");return}
   HOT[id].group.traverse(o=>{if(o.isMesh&&o.material.emissive){if(!o.userData.e0){o.userData.e0=o.material.emissive.clone();o.userData.ei0=o.material.emissiveIntensity}o.material.emissive.setHex(0xff5a10);o.material.emissiveIntensity=.35}});
   const isP=id.startsWith("p:");$("promptLabel").textContent=isP?PEOPLE[id.slice(2)].n:HOTLABEL[id];
@@ -1325,8 +1439,9 @@ function setHover(id){
   $("prompt").classList.remove("hidden");
 }
 function updateMarkers(){for(const id in MARKERS){MARKERS[id].visible=S.diff==="easy"&&!hotDone(id)}}
+function surfaceAt(x,z){const r=roomAtXZ(x,z);if(r==="hall")return Math.abs(x)<.85&&z>-11.5&&z<13.5?"carpet":"marble";if(r==="pantry"||r==="darkroom")return"stone";for(const[cx,cz,w,d]of RUGS)if(Math.abs(x-cx)<w/2&&Math.abs(z-cz)<d/2)return"carpet";return"wood"}
 function updateRoom(){
-  const r=roomAtXZ(player.x,player.z);if(!r||r===curRoom)return;curRoom=r;
+  const r=roomAtXZ(player.x,player.z);if(!r||r===curRoom)return;curRoom=r;AUD.creak();
   $("crumbRoom").textContent=ROOMS[r];$("mmRoom").textContent=ROOMS[r];
   if(!S.visited.has(r)){S.visited.add(r);save()}
   $("rbSub").textContent=ROOMSUB[r];$("rbName").textContent=ROOMS[r];const b=$("roomBanner");b.classList.add("show");clearTimeout(updateRoom.t);updateRoom.t=setTimeout(()=>b.classList.remove("show"),1600);
@@ -1365,18 +1480,14 @@ function loop(t){
   const bob=RM?0:Math.sin(player.bob)*.03;
   cam.position.set(player.x,1.62+bob,player.z);cam.rotation.set(player.pitch,player.yaw,0,"YXZ");
   if((hovAcc+=dt)>.05){hovAcc=0;updateHover()}
-  updateLights(dt,t);updatePeople(dt,t);
+  updateLights(dt,t);updatePeople(dt,t);AUD.update(dt,player.x,player.z,curRoom);
+  if((loop.mood=(loop.mood||0)+dt)>1){loop.mood=0;AUD.setMood({tension:D().limit&&D().limit-S.time<=120?1:0,eerie:curRoom==="study"||curRoom==="darkroom"?1:0})}
   if((mmAcc+=dt)>.1){mmAcc=0;drawMinimap()}
   if((saveAcc+=dt)>5){saveAcc=0;save()}
   renderer.render(scene,cam);perfTick(dt);
 }
 addEventListener("resize",()=>{if(!renderer)return;cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
 document.addEventListener("visibilitychange",()=>{if(document.hidden)save()});
-
-/* audio: synthesized rain (no files) */
-let actx=null,rainGain=null;
-function toggleRain(){try{if(!actx){actx=new(window.AudioContext||window.webkitAudioContext)();const len=actx.sampleRate*2,buf=actx.createBuffer(1,len,actx.sampleRate),d=buf.getChannelData(0);let last=0;for(let i=0;i<len;i++){const w=Math.random()*2-1;last=(last+.02*w)/1.02;d[i]=last*3.5+w*.04}const src=actx.createBufferSource();src.buffer=buf;src.loop=true;const lp=actx.createBiquadFilter();lp.type="lowpass";lp.frequency.value=1400;rainGain=actx.createGain();rainGain.gain.value=0;src.connect(lp).connect(rainGain).connect(actx.destination);src.start()}
-  rainOn=!rainOn;actx.resume();rainGain.gain.setTargetAtTime(rainOn?.35:0,actx.currentTime,.4)}catch(e){toast("이 브라우저에서는 소리를 낼 수 없다")}}
 
 /* ====================================================================
    BOOT
@@ -1395,17 +1506,22 @@ async function boot(state){
   player.x=S.pos.x;player.z=S.pos.z;player.yaw=S.pos.yaw;curRoom=roomAtXZ(player.x,player.z)||"hall";$("crumbRoom").textContent=ROOMS[curRoom];$("mmRoom").textContent=ROOMS[curRoom];
   prNow=Math.min(devicePixelRatio,Q.pr);
   $("loading").classList.add("hidden");$("hud").classList.remove("hidden");
-  bindControls();updateHUD();updateMarkers();requestAnimationFrame(loop);
+  bindControls();updateHUD();updateMarkers();requestAnimationFrame(loop);AUD.startAmbient();AUD.startMusic();
   if(S.over)openAccuse(true);
   else if(!S.log.length){toast("경찰서장: “펠 박사는 심부전이라는데, 레지널드 경은 지난주 나한테 ‘중요한 상의’를 하러 오겠다고 했소.”",true);setTimeout(()=>toast("서재는 홀 왼쪽(서쪽) 첫 번째 문이다. 지도는 M.",true),2500)}
 }
-$("startBtn").addEventListener("click",()=>{clearSave();boot(newState(chosenDiff))});
-$("resumeBtn").addEventListener("click",()=>{const o=load();if(o)boot(o)});
+$("startBtn").addEventListener("click",()=>{AUD.init();clearSave();boot(newState(chosenDiff))});
+$("resumeBtn").addEventListener("click",()=>{AUD.init();const o=load();if(o)boot(o)});
 $("hintBtn").onclick=hint;$("tbHint").onclick=()=>{if(D().hints)hint()};
 $("noteBtn").onclick=()=>openNotebook();$("tbNote").onclick=()=>openNotebook();
 $("mapBtn").onclick=openMap;$("tbMap").onclick=openMap;$("minimapWrap").onclick=openMap;
 $("setBtn").onclick=openSettings;$("tbSet").onclick=openSettings;
 $("accuseBtn").onclick=()=>openAccuse(false);$("tbAccuse").onclick=()=>openAccuse(false);
+
+document.addEventListener("pointerdown",()=>AUD.init(),{capture:true});
+document.addEventListener("click",e=>{const b=e.target.closest("button");if(b&&!b.disabled&&b.id!=="sMute")AUD.click()},true);
+document.querySelectorAll(".rank,.btn,.seg button").forEach(b=>b.addEventListener("mouseenter",()=>AUD.ready()&&AUD.hover()));
+document.addEventListener("change",e=>{if(e.target.matches("input[type=radio],input[type=checkbox],select"))AUD.click()});
 
 </script>
 </body>
